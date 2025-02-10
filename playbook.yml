@@ -1,0 +1,213 @@
+---
+- name: Configure Nginx Reverse Proxy with SSL
+  hosts: localhost
+  become: true
+  vars:
+    repo_url: "https://github.com/dockersamples/linux_tweet_app.git"
+    repo_dest: "/home/ec2-user/linux_tweet_app"
+    image_name: "linux_tweet_app"
+    domain_name: "are-tmp.devril.net"
+    email: "udevril@gmail.com"
+    cert_dir: "/etc/letsencrypt/live/{{ domain_name }}"
+    acme_dir: "/usr/share/nginx/html/.well-known/acme-challenge"
+    
+  pre_tasks:
+    - name: Create required directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ cert_dir }}"
+        - "{{ acme_dir }}"
+        - "/etc/pki/certbot"
+
+  tasks:
+    - name: Install system packages
+      ansible.builtin.dnf:
+        name: 
+          - nginx
+          - docker
+          - python3-pip
+        state: present
+
+    - name: Create virtual environment directory
+      ansible.builtin.file:
+        path: /opt/certbot
+        state: directory
+        mode: '0755'
+
+    - name: Setup Python virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv /opt/certbot
+        creates: /opt/certbot/bin/python
+
+    - name: Install certbot in virtual environment
+      ansible.builtin.pip:
+        name: 
+          - certbot
+          - certbot-nginx
+        virtualenv: /opt/certbot
+        state: present
+
+    - name: Create symlink for certbot command
+      ansible.builtin.file:
+        src: /opt/certbot/bin/certbot
+        dest: /usr/local/bin/certbot
+        state: link
+
+    - name: Configure initial Nginx for ACME challenge
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/{{ domain_name }}.conf
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }};
+              root /usr/share/nginx/html;
+
+              location /.well-known/acme-challenge/ {
+                  allow all;
+                  root /usr/share/nginx/html;
+              }
+
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+          }
+      notify: Restart Nginx
+
+    - name: Ensure Nginx is running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Obtain SSL certificate
+      ansible.builtin.command:
+        cmd: >
+          /opt/certbot/bin/certbot certonly --nginx 
+          -d {{ domain_name }}
+          --email {{ email }}
+          --agree-tos
+          --non-interactive
+          --keep-until-expiring
+      register: certbot_result
+      changed_when: certbot_result.rc == 0
+      
+    - name: Configure Nginx with SSL
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/{{ domain_name }}.conf
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl http2;
+              server_name {{ domain_name }};
+
+              ssl_certificate {{ cert_dir }}/fullchain.pem;
+              ssl_certificate_key {{ cert_dir }}/privkey.pem;
+              ssl_session_timeout 1d;
+              ssl_session_cache shared:SSL:50m;
+              ssl_session_tickets off;
+
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+              ssl_prefer_server_ciphers off;
+
+              ssl_stapling on;
+              ssl_stapling_verify on;
+              resolver 8.8.8.8 8.8.4.4 valid=300s;
+              resolver_timeout 5s;
+
+              location / {
+                  proxy_pass http://localhost:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+      notify: Restart Nginx
+
+    - name: Create certbot renewal service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certbot-renewal.service
+        content: |
+          [Unit]
+          Description=Certbot Renewal Service
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/certbot/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"
+          RandomizedDelaySec=3600
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Create certbot renewal timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certbot-renewal.timer
+        content: |
+          [Unit]
+          Description=Daily Certbot Renewal Timer
+
+          [Timer]
+          OnCalendar=daily
+          RandomizedDelaySec=3600
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Start and enable certbot renewal timer
+      ansible.builtin.systemd:
+        name: certbot-renewal.timer
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Start and enable Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Clone application repository
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ repo_dest }}"
+        clone: yes
+        update: yes
+
+    - name: Build Docker image
+      community.docker.docker_image:
+        name: "{{ image_name }}"
+        build:
+          path: "{{ repo_dest }}"
+        source: build
+        force_source: yes
+
+    - name: Deploy application container
+      community.docker.docker_container:
+        name: tweet_app
+        image: "{{ image_name }}"
+        state: started
+        ports:
+          - "8080:80"
+        restart_policy: always
+
+  handlers:
+    - name: Restart Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+
+    - name: Reload Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

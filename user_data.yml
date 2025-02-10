@@ -1,0 +1,13 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - git
+  - ansible-core
+
+runcmd:
+  - GITHUB_PAT=$(aws ssm get-parameter --name "github_pat" --with-decryption --query Parameter.Value --output text)
+  - git clone https://$GITHUB_PAT@github.com/udevril/sre-task /home/ec2-user/sre-task
+  - chown -R ec2-user:ec2-user /home/ec2-user/sre-task
+  - ansible-galaxy collection install community.docker community.crypto
+  - ansible-playbook --connection=local /home/ec2-user/sre-task/playbook.yml
